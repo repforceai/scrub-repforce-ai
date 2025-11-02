@@ -1,4 +1,9 @@
-// server.js — scrub.repforce.ai (mass + single fallback, Node 20 OK)
+// server.js — scrub.repforce.ai (production build)
+// - Mass endpoint first, fallback to single if 401/forbidden
+// - HTTP keep-alive + token-bucket RPS limiter
+// - Env knobs: MAX_CONCURRENCY, RATE_LIMIT_RPS, TCPA_FORCE_MODE, TCPA_BASE
+// - Portal-style CSVs: Clean Numbers, Bad Numbers, Full Results
+// - Summary breakdown: TCPA, DNC Complainers, Federal DNC, State DNC (+per-state)
 
 import express from "express";
 import multer from "multer";
@@ -12,6 +17,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import Papa from "papaparse";
 import { stringify } from "csv-stringify";
+import https from "https";
 
 dotenv.config();
 
@@ -22,7 +28,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new IOServer(server, { cors: { origin: (o, cb) => cb(null, true) } });
 
-// ===== ENV =====
+// ===== ENV / CONFIG =====
 const PORT = process.env.PORT || 8080;
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
@@ -30,20 +36,23 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 const FILES_DIR = process.env.FILES_DIR || path.join(__dirname, "files");
 const FILE_TTL_HOURS = parseInt(process.env.FILE_TTL_HOURS || "72", 10);
 
+// API creds/hosts
 const TCPA_USER = process.env.TCPA_USER || "";
 const TCPA_PASS = process.env.TCPA_PASS || "";
 
-// We’ll try all known bases/paths automatically
-const TCPA_BASES = [
-  (process.env.TCPA_BASE || "https://api.tcpalitigatorlist.com").replace(/\/+$/,""),
-  "https://api101.tcpalitigatorlist.com"
-];
-const TCPA_MASS_PATHS     = ["/api/scrub/phones/", "/scrub/phones/"];
-const TCPA_SINGLE_PATHS   = ["/api/scrub/phone/",  "/scrub/phone/"];
-const TCPA_MASS_GET_PATHS = ["/api/scrub/phones/get/", "/scrub/phones/get/"];
+// Primary + backup hosts; dedicated host (if provided) overrides first slot
+const PRIMARY_BASE = (process.env.TCPA_BASE || "https://api.tcpalitigatorlist.com").replace(/\/+$/,"");
+const TCPA_BASES = [PRIMARY_BASE, "https://api101.tcpalitigatorlist.com"];
 
-// reasonable concurrency for single endpoint fallback
-const MAX_CONCURRENCY = 12;
+// Routes (try both styles; vendor pages sometimes show with/without /api)
+const TCPA_MASS_PATHS     = ["/api/scrub/phones/", "/scrub/phones/"];
+const TCPA_MASS_GET_PATHS = ["/api/scrub/phones/get/", "/scrub/phones/get/"];
+const TCPA_SINGLE_PATHS   = ["/api/scrub/phone/", "/scrub/phone/"];
+
+// Throttle + mode knobs
+const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "64", 10); // worker pool for single fallback
+const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10); // stay < public 50 rps
+const TCPA_FORCE_MODE = (process.env.TCPA_FORCE_MODE || "auto").toLowerCase(); // auto | single | mass
 
 await fs.mkdir(FILES_DIR, { recursive: true });
 app.use(express.json());
@@ -73,7 +82,7 @@ app.use("/ui", express.static(path.join(__dirname, "ui")));
 app.get("/", (_req,res)=>res.redirect("/ui"));
 app.use("/files", express.static(FILES_DIR));
 
-// Egress IP helper (send this to TCPA if they require IP whitelisting)
+// Egress IP helper (give this IP to TCPA if they whitelist)
 app.get("/debug/egress", async (_req,res)=>{
   try {
     const { data } = await axios.get("https://api.ipify.org?format=json", { timeout: 5000 });
@@ -110,8 +119,8 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
     await fs.writeFile(path.join(FILES_DIR, `upload_${jobId}.json`),
       JSON.stringify({ total: phones.length, at: new Date().toISOString() }));
 
-    // chunk
-    const chunkSize = 5000;
+    // Chunk size only affects mass-path batching/progress noise
+    const chunkSize = 10000;
     const chunks = [];
     for (let i=0;i<phones.length;i+=chunkSize) chunks.push(phones.slice(i,i+chunkSize));
 
@@ -126,8 +135,23 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
   }
 });
 
-// sockets for progress
+// ===== Socket.IO =====
 io.on("connection", ()=>{});
+
+// ===== HTTP keep-alive + rate limiter =====
+const agent = new https.Agent({ keepAlive: true });
+const AX = axios.create({ httpsAgent: agent });
+
+let tokens = RATE_LIMIT_RPS;
+const waiters = [];
+setInterval(() => {
+  tokens = RATE_LIMIT_RPS;
+  while (tokens > 0 && waiters.length) { tokens--; waiters.shift()(); }
+}, 1000);
+function acquireToken() {
+  if (tokens > 0) { tokens--; return Promise.resolve(); }
+  return new Promise(res => waiters.push(res));
+}
 
 // ===== TCPA client helpers =====
 function safeJson(v){ try { return typeof v==="string" ? v : JSON.stringify(v); } catch { return String(v); } }
@@ -139,7 +163,8 @@ async function tcpapost(routeCandidates, payload) {
     for (const route of routeCandidates) {
       const url = `${base}${route}`;
       try {
-        const { data } = await axios.post(url, payload, { auth, timeout: 60000 });
+        await acquireToken();
+        const { data } = await AX.post(url, payload, { auth, timeout: 30000 });
         return data;
       } catch (e) {
         errs.push({ url, status: e?.response?.status, body: e?.response?.data });
@@ -157,7 +182,8 @@ async function tcpapostSingle(routeCandidates, payload) {
     for (const route of routeCandidates) {
       const url = `${base}${route}`;
       try {
-        const { data } = await axios.post(url, payload, { auth, timeout: 30000 });
+        await acquireToken();
+        const { data } = await AX.post(url, payload, { auth, timeout: 12000 });
         return data;
       } catch (e) {
         errs.push({ url, status: e?.response?.status, body: e?.response?.data });
@@ -168,7 +194,7 @@ async function tcpapostSingle(routeCandidates, payload) {
   throw new Error(`TCPA single failed: ${details}`);
 }
 
-// ===== Fallback fan-out via single endpoint =====
+// ===== Single-endpoint fallback fan-out =====
 async function scrubViaSingleEndpoint(phones, types, states) {
   const results = [];
   const queue = [...phones];
@@ -191,7 +217,7 @@ async function scrubViaSingleEndpoint(phones, types, states) {
           status: r.status || ""
         });
       } catch {
-        // be safe: mark as blocked if single call fails
+        // record synthetic error row so job completes visibly
         results.push({
           phone_number: phone, clean: 0, is_bad_number: 1,
           status_array: ["tcpalist_error"], status: "single_endpoint_error"
@@ -205,7 +231,7 @@ async function scrubViaSingleEndpoint(phones, types, states) {
   return results;
 }
 
-// ===== Main scrub orchestration =====
+// ===== Orchestration =====
 async function scrubInChunks(jobId, chunks, options) {
   const results = [];
   let processed = 0;
@@ -213,30 +239,34 @@ async function scrubInChunks(jobId, chunks, options) {
 
   for (let i=0;i<chunks.length;i++){
     const phones = chunks[i];
-    if (i>0) await wait(750);
 
     const payload = { phones, type: options.types || ["tcpa","dnc_complainers"] };
     if (options.states?.length) payload.state = options.states;
 
-    // Try mass first
+    // Try MASS unless forced otherwise
     let data;
     try {
-      data = await tcpapost(TCPA_MASS_PATHS, payload);
+      if (TCPA_FORCE_MODE === "single") throw new Error("force_single");
+      if (TCPA_FORCE_MODE === "mass") {
+        data = await tcpapost(TCPA_MASS_PATHS, payload);
+      } else {
+        data = await tcpapost(TCPA_MASS_PATHS, payload);
+      }
     } catch (e) {
       const msg = String(e?.message || "");
       const forbidden = msg.includes("401") && msg.includes("rest_forbidden");
+      const forced = TCPA_FORCE_MODE === "single";
+      if (!forbidden && !forced && !msg.includes("force_single")) throw e;
 
-      if (!forbidden) throw e; // real error => bubble out
-
-      // Fallback to single endpoint fan-out for this chunk
+      // Fallback: single fan-out for this chunk
       const single = await scrubViaSingleEndpoint(phones, payload.type, payload.state);
       results.push(...single);
       processed += phones.length;
       io.emit(`job:${jobId}:progress`, { processed, total, percent: Math.round(processed/total*100) });
-      continue; // next chunk
+      continue;
     }
 
-    // Mass response handling
+    // MASS handling
     if (Array.isArray(data?.results)) {
       results.push(...data.results);
       processed += phones.length;
@@ -244,7 +274,6 @@ async function scrubInChunks(jobId, chunks, options) {
       continue;
     }
     if (data?.job_id) {
-      // poll job
       const out = await tcpapost(TCPA_MASS_GET_PATHS, { job_id: data.job_id });
       if (!out?.ready || !Array.isArray(out?.results)) throw new Error(`TCPA job not ready or invalid response for job_id ${data.job_id}`);
       results.push(...out.results);
@@ -256,39 +285,99 @@ async function scrubInChunks(jobId, chunks, options) {
     throw new Error(`Unexpected TCPA response ${safeJson(data)}`);
   }
 
-  const { fullCsvPath, cleanCsvPath, summary } = await buildCsvs(results);
+  const { fullPath, cleanPath, badPath, summary } = await buildCsvs(results);
+
   io.emit(`job:${jobId}:done`, {
-    cleanUrl: `/files/${path.basename(cleanCsvPath)}`,
-    fullUrl: `/files/${path.basename(fullCsvPath)}`,
+    cleanUrl: `/files/${path.basename(cleanPath)}`,  // Download Clean Numbers
+    badUrl:   `/files/${path.basename(badPath)}`,    // Download Bad Numbers
+    fullUrl:  `/files/${path.basename(fullPath)}`,   // Download Full Results
     summary
   });
 }
 
-// ===== CSV builders =====
+// ===== Portal-style CSV builder =====
 async function buildCsvs(apiResults) {
-  const full = apiResults.map(r => ({
-    phone: r.phone_number,
-    clean: Number(r.clean),
-    is_bad_number: r.is_bad_number ? 1 : 0,
-    flags: Array.isArray(r.status_array) ? r.status_array.join("|") : "",
-    status: r.status || ""
-  }));
-  const clean = full.filter(r => r.clean === 1 || r.is_bad_number === 0);
+  const rows = apiResults.map(r => {
+    const flagsArr = Array.isArray(r.status_array) ? r.status_array : (Array.isArray(r.flags) ? r.flags : []);
+    const flagsCsv = flagsArr.join(","); // portal uses comma-separated
+    const phone = r.phone_number || r.phone || "";
+    const clean = Number(r.clean ?? (r.is_bad_number ? 0 : 1));
+    const isBad = (r.is_bad_number ?? (r.clean ? 0 : 1)) ? 1 : 0;
+    const status = r.status || "";
+
+    const fset = new Set(flagsArr.map(s => String(s).toLowerCase()));
+    const tcpa            = (fset.has("tcpa") || fset.has("troll") || fset.has("litigator")) ? 1 : 0;
+    const dnc_complainers = fset.has("dnc_complainers") ? 1 : 0;
+    const federal_dnc     = (fset.has("dnc") || fset.has("federal_dnc")) ? 1 : 0;
+
+    let state_dnc = 0, state_code = "";
+    for (const f of fset) {
+      if (f.startsWith("dnc_state")) {
+        state_dnc = 1;
+        const m = f.match(/dnc_state[-:_\s]?([a-z]{2})/i);
+        if (m) state_code = m[1].toUpperCase();
+      }
+    }
+
+    return {
+      phone_number: phone,
+      clean,
+      is_bad_number: isBad,
+      status_array: flagsCsv,
+      status,
+      tcpa,
+      dnc_complainers,
+      federal_dnc,
+      state_dnc,
+      state_code
+    };
+  });
+
+  const isDialable = (r) => (r.clean === 1) || (r.is_bad_number === 0);
+  const cleanRows = rows.filter(isDialable);
+  const badRows   = rows.filter(r => !isDialable(r));
+
+  const COLS = [
+    "phone_number",
+    "clean",
+    "is_bad_number",
+    "status_array",
+    "status",
+    "tcpa",
+    "dnc_complainers",
+    "federal_dnc",
+    "state_dnc",
+    "state_code"
+  ];
 
   const ts = Date.now();
-  const fullCsvPath = path.join(FILES_DIR, `full_results_${ts}.csv`);
-  const cleanCsvPath = path.join(FILES_DIR, `clean_${ts}.csv`);
+  const fullPath  = path.join(FILES_DIR, `full_results_${ts}.csv`);
+  const cleanPath = path.join(FILES_DIR, `clean_numbers_${ts}.csv`);
+  const badPath   = path.join(FILES_DIR, `bad_numbers_${ts}.csv`);
 
-  await writeCsv(fullCsvPath, full);
-  await writeCsv(cleanCsvPath, clean);
+  await writeCsvWithColumns(fullPath,  rows,      COLS);
+  await writeCsvWithColumns(cleanPath, cleanRows, COLS);
+  await writeCsvWithColumns(badPath,   badRows,   COLS);
 
-  return { fullCsvPath, cleanCsvPath, summary: { total: full.length, clean: clean.length, blocked: full.length - clean.length } };
+  const sum = {
+    total: rows.length,
+    clean: cleanRows.length,
+    bad:   badRows.length,
+    breakdown: {
+      tcpa: rows.reduce((a,r)=>a+r.tcpa,0),
+      dnc_complainers: rows.reduce((a,r)=>a+r.dnc_complainers,0),
+      federal_dnc: rows.reduce((a,r)=>a+r.federal_dnc,0),
+      state_dnc: rows.reduce((a,r)=>a+r.state_dnc,0),
+      state_dnc_by_state: rows.reduce((acc,r)=>{ if(r.state_code){ acc[r.state_code]=(acc[r.state_code]||0)+1; } return acc; }, {})
+    }
+  };
+
+  return { fullPath, cleanPath, badPath, summary: sum };
 }
 
-async function writeCsv(filePath, rows){
-  return new Promise((resolve,reject)=>{
-    const columns = Object.keys(rows[0] || { phone:"", clean:0, is_bad_number:0, flags:"", status:"" });
-    const stringifier = stringify(rows, { header: true, columns });
+async function writeCsvWithColumns(filePath, arr, columns) {
+  return new Promise((resolve, reject) => {
+    const stringifier = stringify(arr, { header: true, columns });
     const ws = createWriteStream(filePath);
     stringifier.pipe(ws);
     stringifier.on("error", reject);
@@ -297,9 +386,9 @@ async function writeCsv(filePath, rows){
   });
 }
 
+// ===== housekeeping =====
 function wait(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// ===== housekeeping =====
 setInterval(async ()=>{
   try{
     const ttlMs = FILE_TTL_HOURS * 3600 * 1000;
