@@ -1,9 +1,14 @@
-// server.js — scrub.repforce.ai (production build)
+// server.js — scrub.repforce.ai (round-trip CSVs with original columns)
+// - Preserves ALL original columns from upload; appends scrub results
 // - Mass endpoint first, fallback to single if 401/forbidden
 // - HTTP keep-alive + token-bucket RPS limiter
 // - Env knobs: MAX_CONCURRENCY, RATE_LIMIT_RPS, TCPA_FORCE_MODE, TCPA_BASE
-// - Portal-style CSVs: Clean Numbers, Bad Numbers, Full Results
-// - Summary breakdown: TCPA, DNC Complainers, Federal DNC, State DNC (+per-state)
+// - Outputs (all with original columns + scrub columns):
+//     • clean_numbers_*.csv
+//     • bad_numbers_*.csv
+//     • full_results_*.csv
+// - Per-record progress in SINGLE mode; chunk progress in MASS
+// - Summary breakdown (tcpa, dnc_complainers, federal_dnc, state_dnc, per-state)
 
 import express from "express";
 import multer from "multer";
@@ -44,14 +49,14 @@ const TCPA_PASS = process.env.TCPA_PASS || "";
 const PRIMARY_BASE = (process.env.TCPA_BASE || "https://api.tcpalitigatorlist.com").replace(/\/+$/,"");
 const TCPA_BASES = [PRIMARY_BASE, "https://api101.tcpalitigatorlist.com"];
 
-// Routes (try both styles; vendor pages sometimes show with/without /api)
+// Routes (try both styles; vendor sometimes shows with/without /api)
 const TCPA_MASS_PATHS     = ["/api/scrub/phones/", "/scrub/phones/"];
 const TCPA_MASS_GET_PATHS = ["/api/scrub/phones/get/", "/scrub/phones/get/"];
 const TCPA_SINGLE_PATHS   = ["/api/scrub/phone/", "/scrub/phone/"];
 
 // Throttle + mode knobs
-const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "64", 10); // worker pool for single fallback
-const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10); // stay < public 50 rps
+const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "64", 10);  // single fallback workers
+const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10);  // ~50 rps public; raise on dedicated
 const TCPA_FORCE_MODE = (process.env.TCPA_FORCE_MODE || "auto").toLowerCase(); // auto | single | mass
 
 await fs.mkdir(FILES_DIR, { recursive: true });
@@ -104,29 +109,46 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
     const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
     if (parsed.errors?.length) throw new Error("CSV parse error");
 
-    // accept any header containing "phone"
-    const first = parsed.data[0] || {};
-    const phoneKey = Object.keys(first).find(h => h?.toLowerCase?.().includes("phone")) || "phone";
+    // ORIGINAL ROWS + NORMALIZED PHONE (preserve all columns)
+    const originalRows = parsed.data.map((row, idx) => ({ __idx: idx, __row: row }));
+    const headerRow = parsed.meta?.fields || Object.keys(parsed.data[0] || {});
+    // choose phone column: any header containing "phone"
+    const phoneKey =
+      headerRow.find(h => String(h).toLowerCase().includes("phone")) || "phone";
 
-    const phones = parsed.data
-      .map(r => String(r?.[phoneKey] ?? "").replace(/\D/g,""))
-      .filter(p => p.length >= 10);
+    // build indexable meta list and phones array (keeping per-row index)
+    const metaRows = [];
+    const phones = [];
+    for (const { __idx, __row } of originalRows) {
+      const raw = (__row?.[phoneKey] ?? "").toString();
+      const norm = raw.replace(/\D/g, "");
+      if (norm.length >= 10) {
+        metaRows.push({ idx: __idx, phone: norm, orig: __row });
+        phones.push(norm);
+      } else {
+        // still preserve row; we’ll mark it as error later
+        metaRows.push({ idx: __idx, phone: "", orig: __row, badPhone: true });
+      }
+    }
 
     if (!phones.length)
       throw new Error(`No phone numbers found (looking for a column like "phone"; detected "${phoneKey}").`);
 
     const jobId = Date.now().toString(36);
-    await fs.writeFile(path.join(FILES_DIR, `upload_${jobId}.json`),
-      JSON.stringify({ total: phones.length, at: new Date().toISOString() }));
+    await fs.writeFile(
+      path.join(FILES_DIR, `upload_${jobId}.json`),
+      JSON.stringify({ total: metaRows.length, at: new Date().toISOString(), phoneKey })
+    );
 
-    // Chunk size only affects mass-path batching/progress noise
+    // Chunk size (mass batching/progress frequency)
     const chunkSize = 10000;
     const chunks = [];
     for (let i=0;i<phones.length;i+=chunkSize) chunks.push(phones.slice(i,i+chunkSize));
 
     res.json({ job_id: jobId });
 
-    scrubInChunks(jobId, chunks, options).catch(err=>{
+    // Run asynchronously
+    scrubInChunks(jobId, chunks, options, metaRows, phoneKey).catch(err=>{
       io.emit(`job:${jobId}:error`, { error: err?.message || "Scrub failed" });
     });
 
@@ -153,9 +175,34 @@ function acquireToken() {
   return new Promise(res => waiters.push(res));
 }
 
-// ===== TCPA client helpers =====
+// ===== Utilities =====
 function safeJson(v){ try { return typeof v==="string" ? v : JSON.stringify(v); } catch { return String(v); } }
 
+// Throttled per-record progress emitter (used by SINGLE mode)
+function makeProgress(jobId, total) {
+  let processed = 0;
+  let lastEmit = 0;
+  const minIntervalMs = 60;
+
+  function emit() {
+    const percent = Math.max(0, Math.min(100, Math.round((processed / total) * 100)));
+    io.emit(`job:${jobId}:progress`, { processed, total, percent });
+  }
+  return {
+    inc(n = 1) {
+      processed += n;
+      const now = Date.now();
+      if (now - lastEmit >= minIntervalMs) {
+        lastEmit = now;
+        emit();
+      }
+    },
+    add(n = 1){ this.inc(n); },
+    flush(){ emit(); }
+  };
+}
+
+// ===== TCPA client helpers =====
 async function tcpapost(routeCandidates, payload) {
   const auth = { username: TCPA_USER, password: TCPA_PASS };
   const errs = [];
@@ -194,8 +241,8 @@ async function tcpapostSingle(routeCandidates, payload) {
   throw new Error(`TCPA single failed: ${details}`);
 }
 
-// ===== Single-endpoint fallback fan-out =====
-async function scrubViaSingleEndpoint(phones, types, states) {
+// ===== Single-endpoint fallback (per-record progress) =====
+async function scrubViaSingleEndpoint(phones, types, states, prog) {
   const results = [];
   const queue = [...phones];
   const workers = [];
@@ -222,6 +269,8 @@ async function scrubViaSingleEndpoint(phones, types, states) {
           phone_number: phone, clean: 0, is_bad_number: 1,
           status_array: ["tcpalist_error"], status: "single_endpoint_error"
         });
+      } finally {
+        prog.inc(1);
       }
     }
   }
@@ -231,81 +280,24 @@ async function scrubViaSingleEndpoint(phones, types, states) {
   return results;
 }
 
-// ===== Orchestration =====
-async function scrubInChunks(jobId, chunks, options) {
-  const results = [];
-  let processed = 0;
-  const total = chunks.reduce((a,c)=>a+c.length,0);
-
-  for (let i=0;i<chunks.length;i++){
-    const phones = chunks[i];
-
-    const payload = { phones, type: options.types || ["tcpa","dnc_complainers"] };
-    if (options.states?.length) payload.state = options.states;
-
-    // Try MASS unless forced otherwise
-    let data;
-    try {
-      if (TCPA_FORCE_MODE === "single") throw new Error("force_single");
-      if (TCPA_FORCE_MODE === "mass") {
-        data = await tcpapost(TCPA_MASS_PATHS, payload);
-      } else {
-        data = await tcpapost(TCPA_MASS_PATHS, payload);
-      }
-    } catch (e) {
-      const msg = String(e?.message || "");
-      const forbidden = msg.includes("401") && msg.includes("rest_forbidden");
-      const forced = TCPA_FORCE_MODE === "single";
-      if (!forbidden && !forced && !msg.includes("force_single")) throw e;
-
-      // Fallback: single fan-out for this chunk
-      const single = await scrubViaSingleEndpoint(phones, payload.type, payload.state);
-      results.push(...single);
-      processed += phones.length;
-      io.emit(`job:${jobId}:progress`, { processed, total, percent: Math.round(processed/total*100) });
-      continue;
-    }
-
-    // MASS handling
-    if (Array.isArray(data?.results)) {
-      results.push(...data.results);
-      processed += phones.length;
-      io.emit(`job:${jobId}:progress`, { processed, total, percent: Math.round(processed/total*100) });
-      continue;
-    }
-    if (data?.job_id) {
-      const out = await tcpapost(TCPA_MASS_GET_PATHS, { job_id: data.job_id });
-      if (!out?.ready || !Array.isArray(out?.results)) throw new Error(`TCPA job not ready or invalid response for job_id ${data.job_id}`);
-      results.push(...out.results);
-      processed += phones.length;
-      io.emit(`job:${jobId}:progress`, { processed, total, percent: Math.round(processed/total*100) });
-      continue;
-    }
-
-    throw new Error(`Unexpected TCPA response ${safeJson(data)}`);
+// ===== Merge results back to ORIGINAL columns =====
+function mergeOriginalWithResults(metaRows, results, phoneKey) {
+  // Build queues of original indices per normalized phone (to support duplicates)
+  const phoneToIdxQ = new Map();
+  for (const mr of metaRows) {
+    const p = mr.phone;
+    if (!phoneToIdxQ.has(p)) phoneToIdxQ.set(p, []);
+    phoneToIdxQ.get(p).push(mr.idx);
   }
 
-  const { fullPath, cleanPath, badPath, summary } = await buildCsvs(results);
+  // Map: idx -> appended scrub fields (so we can attach to original row)
+  const attached = new Map();
 
-  io.emit(`job:${jobId}:done`, {
-    cleanUrl: `/files/${path.basename(cleanPath)}`,  // Download Clean Numbers
-    badUrl:   `/files/${path.basename(badPath)}`,    // Download Bad Numbers
-    fullUrl:  `/files/${path.basename(fullPath)}`,   // Download Full Results
-    summary
-  });
-}
-
-// ===== Portal-style CSV builder =====
-async function buildCsvs(apiResults) {
-  const rows = apiResults.map(r => {
-    const flagsArr = Array.isArray(r.status_array) ? r.status_array : (Array.isArray(r.flags) ? r.flags : []);
-    const flagsCsv = flagsArr.join(","); // portal uses comma-separated
-    const phone = r.phone_number || r.phone || "";
-    const clean = Number(r.clean ?? (r.is_bad_number ? 0 : 1));
-    const isBad = (r.is_bad_number ?? (r.clean ? 0 : 1)) ? 1 : 0;
-    const status = r.status || "";
-
-    const fset = new Set(flagsArr.map(s => String(s).toLowerCase()));
+  const normalizeFlagPack = (r) => {
+    const flagsArr = Array.isArray(r.status_array) ? r.status_array
+                    : (Array.isArray(r.flags) ? r.flags : []);
+    const flagsCsv = flagsArr.join(",");
+    const fset = new Set(flagsArr.map(s => String(s || "").toLowerCase()));
     const tcpa            = (fset.has("tcpa") || fset.has("troll") || fset.has("litigator")) ? 1 : 0;
     const dnc_complainers = fset.has("dnc_complainers") ? 1 : 0;
     const federal_dnc     = (fset.has("dnc") || fset.has("federal_dnc")) ? 1 : 0;
@@ -318,57 +310,161 @@ async function buildCsvs(apiResults) {
         if (m) state_code = m[1].toUpperCase();
       }
     }
+    return { flagsCsv, tcpa, dnc_complainers, federal_dnc, state_dnc, state_code };
+  };
+
+  // Attach vendor results to original indices in order
+  for (const r of results) {
+    const ph = (r.phone_number || "").toString().replace(/\D/g, "");
+    const q = phoneToIdxQ.get(ph);
+    if (q && q.length) {
+      const idx = q.shift(); // consume one original row
+      const clean = Number(r.clean ?? (r.is_bad_number ? 0 : 1));
+      const isBad = (r.is_bad_number ?? (r.clean ? 0 : 1)) ? 1 : 0;
+      const status = r.status || "";
+      const pack = normalizeFlagPack(r);
+      attached.set(idx, {
+        phone_normalized: ph,
+        clean,
+        is_bad_number: isBad,
+        status_array: pack.flagsCsv,
+        status,
+        tcpa: pack.tcpa,
+        dnc_complainers: pack.dnc_complainers,
+        federal_dnc: pack.federal_dnc,
+        state_dnc: pack.state_dnc,
+        state_code: pack.state_code
+      });
+    }
+  }
+
+  // Build merged rows preserving ALL original columns and appending scrub fields
+  const merged = metaRows.map(mr => {
+    const orig = { ...(mr.orig || {}) };
+    // keep original phone as-is; also add normalized
+    const added = attached.get(mr.idx) || {
+      phone_normalized: (mr.phone || "").toString(),
+      clean: mr.badPhone ? 0 : 0,
+      is_bad_number: mr.badPhone ? 1 : 1,
+      status_array: mr.badPhone ? "invalid_phone" : "tcpalist_error",
+      status: mr.badPhone ? "invalid_phone" : "no_match_or_error",
+      tcpa: 0, dnc_complainers: 0, federal_dnc: 0, state_dnc: 0, state_code: ""
+    };
+    // Ensure the user’s phone column remains untouched; we append normalized:
+    if (!orig.hasOwnProperty("phone_normalized")) orig["phone_normalized"] = added.phone_normalized;
 
     return {
-      phone_number: phone,
-      clean,
-      is_bad_number: isBad,
-      status_array: flagsCsv,
-      status,
-      tcpa,
-      dnc_complainers,
-      federal_dnc,
-      state_dnc,
-      state_code
+      ...orig,
+      // Append scrub fields
+      clean: added.clean,
+      is_bad_number: added.is_bad_number,
+      status_array: added.status_array,
+      status: added.status,
+      tcpa: added.tcpa,
+      dnc_complainers: added.dnc_complainers,
+      federal_dnc: added.federal_dnc,
+      state_dnc: added.state_dnc,
+      state_code: added.state_code
     };
   });
 
-  const isDialable = (r) => (r.clean === 1) || (r.is_bad_number === 0);
-  const cleanRows = rows.filter(isDialable);
-  const badRows   = rows.filter(r => !isDialable(r));
+  return merged;
+}
 
-  const COLS = [
-    "phone_number",
-    "clean",
-    "is_bad_number",
-    "status_array",
-    "status",
-    "tcpa",
-    "dnc_complainers",
-    "federal_dnc",
-    "state_dnc",
-    "state_code"
-  ];
+// ===== Orchestration =====
+async function scrubInChunks(jobId, chunks, options, metaRows, phoneKey) {
+  const total = metaRows.filter(m => m.phone && m.phone.length >= 10).length;
+  const prog = makeProgress(jobId, total);
+  const results = [];
+
+  for (let i=0;i<chunks.length;i++){
+    const phones = chunks[i];
+    const payload = { phones, type: options.types || ["tcpa","dnc_complainers"] };
+    if (options.states?.length) payload.state = options.states;
+
+    // Try MASS unless forced otherwise
+    let data;
+    try {
+      if (TCPA_FORCE_MODE === "single") throw new Error("force_single");
+      data = await tcpapost(TCPA_MASS_PATHS, payload);
+    } catch (e) {
+      const msg = String(e?.message || "");
+      const forbidden = msg.includes("401") && msg.includes("rest_forbidden");
+      const forced = TCPA_FORCE_MODE === "single" || msg.includes("force_single");
+      if (!forbidden && !forced) throw e;
+
+      // Fallback: single fan-out for this chunk (per-record progress)
+      const single = await scrubViaSingleEndpoint(phones, payload.type, payload.state, prog);
+      results.push(...single);
+      continue;
+    }
+
+    // MASS handling (best-effort chunk progress)
+    if (Array.isArray(data?.results)) {
+      results.push(...data.results);
+      prog.add(phones.length); // bump by chunk
+      continue;
+    }
+    if (data?.job_id) {
+      const out = await tcpapost(TCPA_MASS_GET_PATHS, { job_id: data.job_id });
+      if (!out?.ready || !Array.isArray(out?.results)) throw new Error(`TCPA job not ready or invalid response for job_id ${data.job_id}`);
+      results.push(...out.results);
+      prog.add(phones.length); // bump by chunk when job completes
+      continue;
+    }
+
+    throw new Error(`Unexpected TCPA response ${safeJson(data)}`);
+  }
+
+  // === Merge back into original rows (full round-trip) ===
+  const mergedRows = mergeOriginalWithResults(metaRows, results, phoneKey);
+
+  const { fullPath, cleanPath, badPath, summary } = await buildCsvsRoundTrip(mergedRows);
+
+  prog.flush(); // force final 100%
+
+  io.emit(`job:${jobId}:done`, {
+    cleanUrl: `/files/${path.basename(cleanPath)}`,  // Download Clean Numbers (ALL original cols + scrub cols)
+    badUrl:   `/files/${path.basename(badPath)}`,    // Download Bad Numbers
+    fullUrl:  `/files/${path.basename(fullPath)}`,   // Download Full Results
+    summary
+  });
+}
+
+// ===== Round-trip CSV builder (original cols + scrub cols) =====
+async function buildCsvsRoundTrip(mergedRows) {
+  // Column order: original columns first (in their original order), then appended scrub columns
+  // Collect original columns from the first row (preserve user’s schema)
+  const first = mergedRows[0] || {};
+  const appended = ["phone_normalized","clean","is_bad_number","status_array","status","tcpa","dnc_complainers","federal_dnc","state_dnc","state_code"];
+  const originalCols = Object.keys(first).filter(k => !appended.includes(k));
+
+  const COLS = [...originalCols, ...appended];
+
+  const isDialable = (r) => (Number(r.clean) === 1) || (Number(r.is_bad_number) === 0);
+  const cleanRows = mergedRows.filter(isDialable);
+  const badRows   = mergedRows.filter(r => !isDialable(r));
 
   const ts = Date.now();
   const fullPath  = path.join(FILES_DIR, `full_results_${ts}.csv`);
   const cleanPath = path.join(FILES_DIR, `clean_numbers_${ts}.csv`);
   const badPath   = path.join(FILES_DIR, `bad_numbers_${ts}.csv`);
 
-  await writeCsvWithColumns(fullPath,  rows,      COLS);
-  await writeCsvWithColumns(cleanPath, cleanRows, COLS);
-  await writeCsvWithColumns(badPath,   badRows,   COLS);
+  await writeCsvWithColumns(fullPath,  mergedRows, COLS);
+  await writeCsvWithColumns(cleanPath, cleanRows,  COLS);
+  await writeCsvWithColumns(badPath,   badRows,    COLS);
 
+  // Breakdown for on-screen summary
   const sum = {
-    total: rows.length,
+    total: mergedRows.length,
     clean: cleanRows.length,
     bad:   badRows.length,
     breakdown: {
-      tcpa: rows.reduce((a,r)=>a+r.tcpa,0),
-      dnc_complainers: rows.reduce((a,r)=>a+r.dnc_complainers,0),
-      federal_dnc: rows.reduce((a,r)=>a+r.federal_dnc,0),
-      state_dnc: rows.reduce((a,r)=>a+r.state_dnc,0),
-      state_dnc_by_state: rows.reduce((acc,r)=>{ if(r.state_code){ acc[r.state_code]=(acc[r.state_code]||0)+1; } return acc; }, {})
+      tcpa: mergedRows.reduce((a,r)=>a+Number(r.tcpa||0),0),
+      dnc_complainers: mergedRows.reduce((a,r)=>a+Number(r.dnc_complainers||0),0),
+      federal_dnc: mergedRows.reduce((a,r)=>a+Number(r.federal_dnc||0),0),
+      state_dnc: mergedRows.reduce((a,r)=>a+Number(r.state_dnc||0),0),
+      state_dnc_by_state: mergedRows.reduce((acc,r)=>{ const s=(r.state_code||"").toString().toUpperCase(); if(s){ acc[s]=(acc[s]||0)+1; } return acc; }, {})
     }
   };
 
