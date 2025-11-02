@@ -5,21 +5,40 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Repforce Scrubber</title>
   <style>
-    :root{ --bg:#0b0b0b; --fg:#fff; --muted:#bfbfbf; --brand:#ff7a00; }
-    body{ margin:0; font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--fg); }
-    .wrap{ max-width:860px; margin:40px auto; padding:0 16px; }
-    .card{ background:#111; border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.25); }
-    h1{ margin:0 0 4px; font-size:24px; letter-spacing:-.2px; }
-    p{ color:var(--muted); margin:6px 0 16px; }
-    .drop{ border:2px dashed rgba(255,255,255,.15); border-radius:12px; padding:24px; text-align:center; }
-    .btn{ background:var(--brand); color:#111; border:none; padding:10px 14px; border-radius:10px; font-weight:700; cursor:pointer; }
-    .options{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:12px; }
-    .opt{ background:#0f0f0f; border:1px solid rgba(255,255,255,.08); padding:10px; border-radius:10px; }
-    .progress{ margin-top:16px; height:14px; background:#1a1a1a; border-radius:10px; overflow:hidden; border:1px solid rgba(255,255,255,.06); }
-    .bar{ height:100%; width:0%; background:linear-gradient(90deg, #ff7a00,#ffd400); }
-    .row{ display:flex; gap:8px; align-items:center; }
-    .stat{ background:#0f0f0f; padding:10px; border-radius:10px; border:1px solid rgba(255,255,255,.08); }
-    a.dl{ color:#fff; text-decoration:none; background:#1a1a1a; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,.08); }
+    :root {
+      --bg:#0b0b0b; --fg:#fff; --muted:#bfbfbf; --brand:#ff7a00;
+    }
+    body {
+      margin:0; font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+      background:var(--bg); color:var(--fg);
+    }
+    .wrap { max-width:860px; margin:40px auto; padding:0 16px; }
+    .card { background:#111; border:1px solid rgba(255,255,255,.08);
+      border-radius:14px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.25);
+    }
+    h1 { margin:0 0 4px; font-size:24px; letter-spacing:-.2px; }
+    p { color:var(--muted); margin:6px 0 16px; }
+    .drop { border:2px dashed rgba(255,255,255,.15); border-radius:12px; padding:24px; text-align:center; }
+    .btn { background:var(--brand); color:#111; border:none; padding:10px 14px;
+      border-radius:10px; font-weight:700; cursor:pointer;
+    }
+    .options { display:grid; grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:10px; margin-top:12px;
+    }
+    .opt { background:#0f0f0f; border:1px solid rgba(255,255,255,.08);
+      padding:10px; border-radius:10px;
+    }
+    .progress { margin-top:16px; height:14px; background:#1a1a1a;
+      border-radius:10px; overflow:hidden; border:1px solid rgba(255,255,255,.06);
+    }
+    .bar { height:100%; width:0%; background:linear-gradient(90deg,#ff7a00,#ffd400); }
+    .row { display:flex; gap:8px; align-items:center; }
+    .stat { background:#0f0f0f; padding:10px; border-radius:10px;
+      border:1px solid rgba(255,255,255,.08);
+    }
+    a.dl { color:#fff; text-decoration:none; background:#1a1a1a; padding:10px 12px;
+      border-radius:10px; border:1px solid rgba(255,255,255,.08);
+    }
   </style>
 </head>
 <body>
@@ -29,25 +48,29 @@
       <p>Upload a CSV with a <strong>phone</strong> column. Choose options. Get a clean list.</p>
 
       <div class="drop">
-        <input type="file" id="file" accept=".csv"/>
+        <input type="file" id="file" accept=".csv" />
       </div>
 
       <div class="options">
-        <label class="opt"><input type="checkbox" value="tcpa" checked/> TCPA</label>
-        <label class="opt"><input type="checkbox" value="dnc_complainers" checked/> DNC Complainers</label>
-        <label class="opt"><input type="checkbox" value="dnc_state"/> State DNC</label>
+        <label class="opt"><input type="checkbox" value="tcpa" checked> TCPA</label>
+        <label class="opt"><input type="checkbox" value="dnc_complainers" checked> DNC Complainers</label>
+        <label class="opt"><input type="checkbox" value="dnc_state"> State DNC</label>
       </div>
 
       <div style="margin-top:10px">
         <label>States (comma-separated, optional)</label>
-        <input id="states" placeholder="FL,NY,CA" style="width:100%;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);background:#0f0f0f;color:#fff"/>
+        <input id="states" placeholder="FL,NY,CA"
+          style="width:100%;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
+          background:#0f0f0f;color:#fff" />
       </div>
 
       <div style="margin-top:12px">
         <button class="btn" id="start">Start Scrub</button>
       </div>
 
-      <div class="progress" style="margin-top:18px"><div class="bar" id="bar"></div></div>
+      <div class="progress" style="margin-top:18px">
+        <div class="bar" id="bar"></div>
+      </div>
       <div class="row" style="margin-top:10px">
         <div class="stat"><span id="pct">0%</span></div>
         <div class="stat">Processed: <span id="proc">0</span></div>
@@ -75,34 +98,51 @@
       if (!file) return alert('Pick a CSV');
 
       const checks = [...document.querySelectorAll('.options input[type=checkbox]:checked')].map(i => i.value);
-      const states = document.getElementById('states').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean);
+      const states = document.getElementById('states').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 
       const fd = new FormData();
       fd.append('file', file);
       fd.append('optionsJson', JSON.stringify({ types: checks, states }));
+
       msg.textContent = 'Uploading…';
       downloads.innerHTML = '';
       bar.style.width = '0%'; pct.textContent = '0%'; proc.textContent = '0'; tot.textContent = '0';
 
-      const r = await fetch('/api/upload', { method: 'POST', body: fd });
-      const j = await r.json();
-      if (j.error) { msg.textContent = 'Error: ' + j.error; return; }
-      msg.textContent = 'Processing…';
-      const channel = j.job_id;
+      try {
+        const r = await fetch(window.location.origin + '/api/upload', { method: 'POST', body: fd });
+        const j = await r.json();
 
-      socket.on(`job:${channel}:progress`, (data) => {
-        const { processed, total, percent } = data;
-        bar.style.width = percent + '%';
-        pct.textContent = percent + '%';
-        proc.textContent = processed;
-        tot.textContent = total;
-      });
-      socket.on(`job:${channel}:done`, (data) => {
-        msg.textContent = 'Done.';
-        downloads.innerHTML = \`<a class="dl" href="\${data.cleanUrl}" download>Download clean.csv</a> &nbsp;|&nbsp; 
-                                <a class="dl" href="\${data.fullUrl}" download>Download full_results.csv</a>\`;
-      });
-      socket.on(`job:${channel}:error`, (data) => { msg.textContent = 'Error: ' + (data.error || 'Unknown'); });
+        if (j.error) {
+          msg.textContent = 'Error: ' + j.error;
+          return;
+        }
+
+        msg.textContent = 'Processing…';
+        const channel = j.job_id;
+
+        socket.on(`job:${channel}:progress`, data => {
+          const { processed, total, percent } = data;
+          bar.style.width = percent + '%';
+          pct.textContent = percent + '%';
+          proc.textContent = processed;
+          tot.textContent = total;
+        });
+
+        socket.on(`job:${channel}:done`, data => {
+          msg.textContent = 'Done.';
+          downloads.innerHTML =
+            `<a class="dl" href="${data.cleanUrl}" download>Download clean.csv</a> &nbsp;|&nbsp; 
+             <a class="dl" href="${data.fullUrl}" download>Download full_results.csv</a>`;
+        });
+
+        socket.on(`job:${channel}:error`, data => {
+          msg.textContent = 'Error: ' + (data.error || 'Unknown');
+        });
+
+      } catch (err) {
+        console.error(err);
+        msg.textContent = 'Error connecting to API';
+      }
     };
   </script>
 </body>
