@@ -1,0 +1,32 @@
+<!-- Paste this into AutoCalls Custom Scripts -->
+<script>
+(function(){
+  const IFRAME_SRC = "https://scrub.repforce.ai/ui"; // change to your deployed URL
+  const PANEL_ID = "rf-scrubber-panel";
+  const BTN_ID = "rf-scrubber-btn";
+
+  const ready = setInterval(() => {
+    const header = document.querySelector('header, .topbar, [data-testid="top-nav"]') || document.body;
+    if (!header) return;
+    if (document.getElementById(BTN_ID)) { clearInterval(ready); return; }
+
+    const btn = document.createElement('button');
+    btn.id = BTN_ID;
+    btn.textContent = 'Scrubber';
+    btn.style.cssText = "margin-left:12px;padding:8px 12px;border-radius:10px;font:600 14px/1.1 Inter,system-ui;background:#111;color:#fff;border:1px solid rgba(255,255,255,.12);cursor:pointer;";
+    btn.onclick = () => {
+      const panel = document.getElementById(PANEL_ID);
+      panel.style.display = (panel.style.display === 'none' ? 'block' : 'none');
+    };
+    header.appendChild(btn);
+
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.style.cssText = "position:fixed;top:64px;right:0;width:520px;height:calc(100vh - 72px);background:#0b0b0b;border-left:1px solid rgba(255,255,255,.08);z-index:999999;display:none;box-shadow:-6px 0 22px rgba(0,0,0,.35);border-top-left-radius:12px;";
+    panel.innerHTML = '<iframe src="'+IFRAME_SRC+'" style="width:100%;height:100%;border:0" allow="clipboard-read; clipboard-write"></iframe>';
+    document.body.appendChild(panel);
+
+    clearInterval(ready);
+  }, 500);
+})();
+</script>

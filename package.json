@@ -1,0 +1,21 @@
+{
+  "name": "scrub-repforce-ai",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "csv-parse": "^5.5.6",
+    "csv-stringify": "^6.5.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mime-types": "^2.1.35",
+    "multer": "^1.4.5-lts.1",
+    "papaparse": "^5.4.1",
+    "socket.io": "^4.7.5"
+  }
+}
