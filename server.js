@@ -1,14 +1,10 @@
-// server.js — scrub.repforce.ai (round-trip CSVs with original columns)
-// - Preserves ALL original columns from upload; appends scrub results
-// - Mass endpoint first, fallback to single if 401/forbidden
-// - HTTP keep-alive + token-bucket RPS limiter
-// - Env knobs: MAX_CONCURRENCY, RATE_LIMIT_RPS, TCPA_FORCE_MODE, TCPA_BASE
-// - Outputs (all with original columns + scrub columns):
-//     • clean_numbers_*.csv
-//     • bad_numbers_*.csv
-//     • full_results_*.csv
-// - Per-record progress in SINGLE mode; chunk progress in MASS
-// - Summary breakdown (tcpa, dnc_complainers, federal_dnc, state_dnc, per-state)
+// server.js — scrub.repforce.ai (final)
+// - Uses TCPA /scrub/phones and /scrub/phone (no /api prefix)
+// - Single payload uses "phone_number" (per vendor requirement)
+// - Mass first, single fallback (per-record progress)
+// - Keep-alive, RPS limiter, env knobs
+// - Round-trip CSVs: original columns + appended scrub fields
+// - Summary breakdown + /debug/egress
 
 import express from "express";
 import multer from "multer";
@@ -41,29 +37,28 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 const FILES_DIR = process.env.FILES_DIR || path.join(__dirname, "files");
 const FILE_TTL_HOURS = parseInt(process.env.FILE_TTL_HOURS || "72", 10);
 
-// API creds/hosts
 const TCPA_USER = process.env.TCPA_USER || "";
 const TCPA_PASS = process.env.TCPA_PASS || "";
 
-// Primary + backup hosts; dedicated host (if provided) overrides first slot
+// Base host (dedicated host if TCPA gives you one)
 const PRIMARY_BASE = (process.env.TCPA_BASE || "https://api.tcpalitigatorlist.com").replace(/\/+$/,"");
 const TCPA_BASES = [PRIMARY_BASE, "https://api101.tcpalitigatorlist.com"];
 
-// Routes (try both styles; vendor sometimes shows with/without /api)
-const TCPA_MASS_PATHS     = ["/api/scrub/phones/", "/scrub/phones/"];
-const TCPA_MASS_GET_PATHS = ["/api/scrub/phones/get/", "/scrub/phones/get/"];
-const TCPA_SINGLE_PATHS   = ["/api/scrub/phone/", "/scrub/phone/"];
+// Valid routes (no /api prefix)
+const TCPA_MASS_PATHS     = ["/scrub/phones/"];
+const TCPA_MASS_GET_PATHS = ["/scrub/phones/get/"];
+const TCPA_SINGLE_PATHS   = ["/scrub/phone/"];
 
 // Throttle + mode knobs
-const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "64", 10);  // single fallback workers
-const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10);  // ~50 rps public; raise on dedicated
+const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "64", 10);   // single fallback workers
+const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10);   // public single ~50 rps; raise on dedicated
 const TCPA_FORCE_MODE = (process.env.TCPA_FORCE_MODE || "auto").toLowerCase(); // auto | single | mass
 
 await fs.mkdir(FILES_DIR, { recursive: true });
 app.use(express.json());
 
 // ===== CORS =====
-app.use((req, res, next) => {
+app.use((req,res,next)=>{
   const origin = req.headers.origin;
   const ok = !ALLOWED_ORIGINS.length || (origin && ALLOWED_ORIGINS.some(o=>{
     if (o.includes("*")) {
@@ -74,9 +69,9 @@ app.use((req, res, next) => {
   }));
   if (ok) {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Credentials","true");
+    res.setHeader("Access-Control-Allow-Headers","Content-Type, Authorization");
+    res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
   }
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
@@ -109,14 +104,13 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
     const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
     if (parsed.errors?.length) throw new Error("CSV parse error");
 
-    // ORIGINAL ROWS + NORMALIZED PHONE (preserve all columns)
+    // Preserve ALL original columns/rows
     const originalRows = parsed.data.map((row, idx) => ({ __idx: idx, __row: row }));
     const headerRow = parsed.meta?.fields || Object.keys(parsed.data[0] || {});
     // choose phone column: any header containing "phone"
-    const phoneKey =
-      headerRow.find(h => String(h).toLowerCase().includes("phone")) || "phone";
+    const phoneKey = headerRow.find(h => String(h).toLowerCase().includes("phone")) || "phone";
 
-    // build indexable meta list and phones array (keeping per-row index)
+    // Build meta list and phones array
     const metaRows = [];
     const phones = [];
     for (const { __idx, __row } of originalRows) {
@@ -126,7 +120,6 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
         metaRows.push({ idx: __idx, phone: norm, orig: __row });
         phones.push(norm);
       } else {
-        // still preserve row; we’ll mark it as error later
         metaRows.push({ idx: __idx, phone: "", orig: __row, badPhone: true });
       }
     }
@@ -140,7 +133,7 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
       JSON.stringify({ total: metaRows.length, at: new Date().toISOString(), phoneKey })
     );
 
-    // Chunk size (mass batching/progress frequency)
+    // Chunk size for mass batching/progress frequency
     const chunkSize = 10000;
     const chunks = [];
     for (let i=0;i<phones.length;i+=chunkSize) chunks.push(phones.slice(i,i+chunkSize));
@@ -160,7 +153,7 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
 // ===== Socket.IO =====
 io.on("connection", ()=>{});
 
-// ===== HTTP keep-alive + rate limiter =====
+// ===== Keep-alive + RPS limiter =====
 const agent = new https.Agent({ keepAlive: true });
 const AX = axios.create({ httpsAgent: agent });
 
@@ -178,12 +171,11 @@ function acquireToken() {
 // ===== Utilities =====
 function safeJson(v){ try { return typeof v==="string" ? v : JSON.stringify(v); } catch { return String(v); } }
 
-// Throttled per-record progress emitter (used by SINGLE mode)
+// Throttled per-record progress (single mode)
 function makeProgress(jobId, total) {
   let processed = 0;
   let lastEmit = 0;
   const minIntervalMs = 60;
-
   function emit() {
     const percent = Math.max(0, Math.min(100, Math.round((processed / total) * 100)));
     io.emit(`job:${jobId}:progress`, { processed, total, percent });
@@ -192,12 +184,9 @@ function makeProgress(jobId, total) {
     inc(n = 1) {
       processed += n;
       const now = Date.now();
-      if (now - lastEmit >= minIntervalMs) {
-        lastEmit = now;
-        emit();
-      }
+      if (now - lastEmit >= minIntervalMs) { lastEmit = now; emit(); }
     },
-    add(n = 1){ this.inc(n); },
+    add(n=1){ this.inc(n); },
     flush(){ emit(); }
   };
 }
@@ -250,7 +239,7 @@ async function scrubViaSingleEndpoint(phones, types, states, prog) {
   async function worker() {
     while (queue.length) {
       const phone = queue.shift();
-      const payload = { phone, type: Array.isArray(types) && types.length === 1 ? String(types[0]) : types };
+      const payload = { phone_number: phone, type: Array.isArray(types) && types.length === 1 ? String(types[0]) : types };
       if (states?.length) payload.state = states;
 
       try {
@@ -264,7 +253,6 @@ async function scrubViaSingleEndpoint(phones, types, states, prog) {
           status: r.status || ""
         });
       } catch {
-        // record synthetic error row so job completes visibly
         results.push({
           phone_number: phone, clean: 0, is_bad_number: 1,
           status_array: ["tcpalist_error"], status: "single_endpoint_error"
@@ -282,15 +270,12 @@ async function scrubViaSingleEndpoint(phones, types, states, prog) {
 
 // ===== Merge results back to ORIGINAL columns =====
 function mergeOriginalWithResults(metaRows, results, phoneKey) {
-  // Build queues of original indices per normalized phone (to support duplicates)
   const phoneToIdxQ = new Map();
   for (const mr of metaRows) {
     const p = mr.phone;
     if (!phoneToIdxQ.has(p)) phoneToIdxQ.set(p, []);
     phoneToIdxQ.get(p).push(mr.idx);
   }
-
-  // Map: idx -> appended scrub fields (so we can attach to original row)
   const attached = new Map();
 
   const normalizeFlagPack = (r) => {
@@ -313,12 +298,11 @@ function mergeOriginalWithResults(metaRows, results, phoneKey) {
     return { flagsCsv, tcpa, dnc_complainers, federal_dnc, state_dnc, state_code };
   };
 
-  // Attach vendor results to original indices in order
   for (const r of results) {
     const ph = (r.phone_number || "").toString().replace(/\D/g, "");
     const q = phoneToIdxQ.get(ph);
     if (q && q.length) {
-      const idx = q.shift(); // consume one original row
+      const idx = q.shift();
       const clean = Number(r.clean ?? (r.is_bad_number ? 0 : 1));
       const isBad = (r.is_bad_number ?? (r.clean ? 0 : 1)) ? 1 : 0;
       const status = r.status || "";
@@ -338,10 +322,8 @@ function mergeOriginalWithResults(metaRows, results, phoneKey) {
     }
   }
 
-  // Build merged rows preserving ALL original columns and appending scrub fields
   const merged = metaRows.map(mr => {
     const orig = { ...(mr.orig || {}) };
-    // keep original phone as-is; also add normalized
     const added = attached.get(mr.idx) || {
       phone_normalized: (mr.phone || "").toString(),
       clean: mr.badPhone ? 0 : 0,
@@ -350,12 +332,10 @@ function mergeOriginalWithResults(metaRows, results, phoneKey) {
       status: mr.badPhone ? "invalid_phone" : "no_match_or_error",
       tcpa: 0, dnc_complainers: 0, federal_dnc: 0, state_dnc: 0, state_code: ""
     };
-    // Ensure the user’s phone column remains untouched; we append normalized:
     if (!orig.hasOwnProperty("phone_normalized")) orig["phone_normalized"] = added.phone_normalized;
 
     return {
       ...orig,
-      // Append scrub fields
       clean: added.clean,
       is_bad_number: added.is_bad_number,
       status_array: added.status_array,
@@ -382,7 +362,6 @@ async function scrubInChunks(jobId, chunks, options, metaRows, phoneKey) {
     const payload = { phones, type: options.types || ["tcpa","dnc_complainers"] };
     if (options.states?.length) payload.state = options.states;
 
-    // Try MASS unless forced otherwise
     let data;
     try {
       if (TCPA_FORCE_MODE === "single") throw new Error("force_single");
@@ -393,52 +372,45 @@ async function scrubInChunks(jobId, chunks, options, metaRows, phoneKey) {
       const forced = TCPA_FORCE_MODE === "single" || msg.includes("force_single");
       if (!forbidden && !forced) throw e;
 
-      // Fallback: single fan-out for this chunk (per-record progress)
       const single = await scrubViaSingleEndpoint(phones, payload.type, payload.state, prog);
       results.push(...single);
       continue;
     }
 
-    // MASS handling (best-effort chunk progress)
     if (Array.isArray(data?.results)) {
       results.push(...data.results);
-      prog.add(phones.length); // bump by chunk
+      prog.add(phones.length);
       continue;
     }
     if (data?.job_id) {
       const out = await tcpapost(TCPA_MASS_GET_PATHS, { job_id: data.job_id });
       if (!out?.ready || !Array.isArray(out?.results)) throw new Error(`TCPA job not ready or invalid response for job_id ${data.job_id}`);
       results.push(...out.results);
-      prog.add(phones.length); // bump by chunk when job completes
+      prog.add(phones.length);
       continue;
     }
 
     throw new Error(`Unexpected TCPA response ${safeJson(data)}`);
   }
 
-  // === Merge back into original rows (full round-trip) ===
   const mergedRows = mergeOriginalWithResults(metaRows, results, phoneKey);
-
   const { fullPath, cleanPath, badPath, summary } = await buildCsvsRoundTrip(mergedRows);
 
-  prog.flush(); // force final 100%
+  prog.flush();
 
   io.emit(`job:${jobId}:done`, {
-    cleanUrl: `/files/${path.basename(cleanPath)}`,  // Download Clean Numbers (ALL original cols + scrub cols)
-    badUrl:   `/files/${path.basename(badPath)}`,    // Download Bad Numbers
-    fullUrl:  `/files/${path.basename(fullPath)}`,   // Download Full Results
+    cleanUrl: `/files/${path.basename(cleanPath)}`,
+    badUrl:   `/files/${path.basename(badPath)}`,
+    fullUrl:  `/files/${path.basename(fullPath)}`,
     summary
   });
 }
 
-// ===== Round-trip CSV builder (original cols + scrub cols) =====
+// ===== Round-trip CSV builder =====
 async function buildCsvsRoundTrip(mergedRows) {
-  // Column order: original columns first (in their original order), then appended scrub columns
-  // Collect original columns from the first row (preserve user’s schema)
   const first = mergedRows[0] || {};
   const appended = ["phone_normalized","clean","is_bad_number","status_array","status","tcpa","dnc_complainers","federal_dnc","state_dnc","state_code"];
   const originalCols = Object.keys(first).filter(k => !appended.includes(k));
-
   const COLS = [...originalCols, ...appended];
 
   const isDialable = (r) => (Number(r.clean) === 1) || (Number(r.is_bad_number) === 0);
@@ -454,7 +426,6 @@ async function buildCsvsRoundTrip(mergedRows) {
   await writeCsvWithColumns(cleanPath, cleanRows,  COLS);
   await writeCsvWithColumns(badPath,   badRows,    COLS);
 
-  // Breakdown for on-screen summary
   const sum = {
     total: mergedRows.length,
     clean: cleanRows.length,
