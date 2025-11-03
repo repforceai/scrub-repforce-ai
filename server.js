@@ -1,10 +1,9 @@
-// server.js — scrub.repforce.ai (final)
-// - Uses TCPA /scrub/phones and /scrub/phone (no /api prefix)
-// - Single payload uses "phone_number" (per vendor requirement)
-// - Mass first, single fallback (per-record progress)
-// - Keep-alive, RPS limiter, env knobs
-// - Round-trip CSVs: original columns + appended scrub fields
-// - Summary breakdown + /debug/egress
+// server.js — scrub.repforce.ai (final, single endpoint fixed to /phone/scrub)
+// - Mass:  POST https://api.tcpalitigatorlist.com/scrub/phones/
+// - Single: POST https://api.tcpalitigatorlist.com/phone/scrub/   (per vendor email)
+// - Single payload uses "phone_number"
+// - Mass-first with single fallback (per-record progress), keep-alive, RPS limiter
+// - Round-trip CSVs (all original columns + scrub fields), summary breakdown, /debug/egress
 
 import express from "express";
 import multer from "multer";
@@ -40,18 +39,18 @@ const FILE_TTL_HOURS = parseInt(process.env.FILE_TTL_HOURS || "72", 10);
 const TCPA_USER = process.env.TCPA_USER || "";
 const TCPA_PASS = process.env.TCPA_PASS || "";
 
-// Base host (dedicated host if TCPA gives you one)
+// Base host (swap to dedicated if they give you one)
 const PRIMARY_BASE = (process.env.TCPA_BASE || "https://api.tcpalitigatorlist.com").replace(/\/+$/,"");
 const TCPA_BASES = [PRIMARY_BASE, "https://api101.tcpalitigatorlist.com"];
 
 // Valid routes (no /api prefix)
 const TCPA_MASS_PATHS     = ["/scrub/phones/"];
 const TCPA_MASS_GET_PATHS = ["/scrub/phones/get/"];
-const TCPA_SINGLE_PATHS   = ["/scrub/phone/"];
+const TCPA_SINGLE_PATHS   = ["/phone/scrub/"];   // <— fixed per vendor email
 
 // Throttle + mode knobs
-const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "64", 10);   // single fallback workers
-const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10);   // public single ~50 rps; raise on dedicated
+const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "64", 10);
+const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10);
 const TCPA_FORCE_MODE = (process.env.TCPA_FORCE_MODE || "auto").toLowerCase(); // auto | single | mass
 
 await fs.mkdir(FILES_DIR, { recursive: true });
@@ -82,11 +81,11 @@ app.use("/ui", express.static(path.join(__dirname, "ui")));
 app.get("/", (_req,res)=>res.redirect("/ui"));
 app.use("/files", express.static(FILES_DIR));
 
-// Egress IP helper (give this IP to TCPA if they whitelist)
+// Egress IP (send to TCPA if they whitelist)
 app.get("/debug/egress", async (_req,res)=>{
   try {
     const { data } = await axios.get("https://api.ipify.org?format=json", { timeout: 5000 });
-    res.json(data); // { ip: "x.x.x.x" }
+    res.json(data);
   } catch (e) { res.status(500).json({ error: e?.message || "ipify failed" }); }
 });
 
@@ -104,13 +103,11 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
     const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
     if (parsed.errors?.length) throw new Error("CSV parse error");
 
-    // Preserve ALL original columns/rows
+    // Preserve all original columns/rows
     const originalRows = parsed.data.map((row, idx) => ({ __idx: idx, __row: row }));
     const headerRow = parsed.meta?.fields || Object.keys(parsed.data[0] || {});
-    // choose phone column: any header containing "phone"
     const phoneKey = headerRow.find(h => String(h).toLowerCase().includes("phone")) || "phone";
 
-    // Build meta list and phones array
     const metaRows = [];
     const phones = [];
     for (const { __idx, __row } of originalRows) {
@@ -133,14 +130,12 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
       JSON.stringify({ total: metaRows.length, at: new Date().toISOString(), phoneKey })
     );
 
-    // Chunk size for mass batching/progress frequency
-    const chunkSize = 10000;
+    const chunkSize = 10000; // mass batching/progress frequency
     const chunks = [];
     for (let i=0;i<phones.length;i+=chunkSize) chunks.push(phones.slice(i,i+chunkSize));
 
     res.json({ job_id: jobId });
 
-    // Run asynchronously
     scrubInChunks(jobId, chunks, options, metaRows, phoneKey).catch(err=>{
       io.emit(`job:${jobId}:error`, { error: err?.message || "Scrub failed" });
     });
@@ -171,24 +166,11 @@ function acquireToken() {
 // ===== Utilities =====
 function safeJson(v){ try { return typeof v==="string" ? v : JSON.stringify(v); } catch { return String(v); } }
 
-// Throttled per-record progress (single mode)
 function makeProgress(jobId, total) {
-  let processed = 0;
-  let lastEmit = 0;
+  let processed = 0, lastEmit = 0;
   const minIntervalMs = 60;
-  function emit() {
-    const percent = Math.max(0, Math.min(100, Math.round((processed / total) * 100)));
-    io.emit(`job:${jobId}:progress`, { processed, total, percent });
-  }
-  return {
-    inc(n = 1) {
-      processed += n;
-      const now = Date.now();
-      if (now - lastEmit >= minIntervalMs) { lastEmit = now; emit(); }
-    },
-    add(n=1){ this.inc(n); },
-    flush(){ emit(); }
-  };
+  function emit(){ io.emit(`job:${jobId}:progress`, { processed, total, percent: Math.round((processed/total)*100) }); }
+  return { inc(n=1){ processed+=n; const now=Date.now(); if(now-lastEmit>=minIntervalMs){ lastEmit=now; emit(); } }, add(n=1){ this.inc(n); }, flush(){ emit(); } };
 }
 
 // ===== TCPA client helpers =====
@@ -253,10 +235,7 @@ async function scrubViaSingleEndpoint(phones, types, states, prog) {
           status: r.status || ""
         });
       } catch {
-        results.push({
-          phone_number: phone, clean: 0, is_bad_number: 1,
-          status_array: ["tcpalist_error"], status: "single_endpoint_error"
-        });
+        results.push({ phone_number: phone, clean: 0, is_bad_number: 1, status_array: ["tcpalist_error"], status: "single_endpoint_error" });
       } finally {
         prog.inc(1);
       }
@@ -279,14 +258,12 @@ function mergeOriginalWithResults(metaRows, results, phoneKey) {
   const attached = new Map();
 
   const normalizeFlagPack = (r) => {
-    const flagsArr = Array.isArray(r.status_array) ? r.status_array
-                    : (Array.isArray(r.flags) ? r.flags : []);
+    const flagsArr = Array.isArray(r.status_array) ? r.status_array : (Array.isArray(r.flags) ? r.flags : []);
     const flagsCsv = flagsArr.join(",");
     const fset = new Set(flagsArr.map(s => String(s || "").toLowerCase()));
     const tcpa            = (fset.has("tcpa") || fset.has("troll") || fset.has("litigator")) ? 1 : 0;
     const dnc_complainers = fset.has("dnc_complainers") ? 1 : 0;
     const federal_dnc     = (fset.has("dnc") || fset.has("federal_dnc")) ? 1 : 0;
-
     let state_dnc = 0, state_code = "";
     for (const f of fset) {
       if (f.startsWith("dnc_state")) {
@@ -309,15 +286,10 @@ function mergeOriginalWithResults(metaRows, results, phoneKey) {
       const pack = normalizeFlagPack(r);
       attached.set(idx, {
         phone_normalized: ph,
-        clean,
-        is_bad_number: isBad,
-        status_array: pack.flagsCsv,
-        status,
-        tcpa: pack.tcpa,
-        dnc_complainers: pack.dnc_complainers,
-        federal_dnc: pack.federal_dnc,
-        state_dnc: pack.state_dnc,
-        state_code: pack.state_code
+        clean, is_bad_number: isBad,
+        status_array: pack.flagsCsv, status,
+        tcpa: pack.tcpa, dnc_complainers: pack.dnc_complainers,
+        federal_dnc: pack.federal_dnc, state_dnc: pack.state_dnc, state_code: pack.state_code
       });
     }
   }
@@ -333,18 +305,11 @@ function mergeOriginalWithResults(metaRows, results, phoneKey) {
       tcpa: 0, dnc_complainers: 0, federal_dnc: 0, state_dnc: 0, state_code: ""
     };
     if (!orig.hasOwnProperty("phone_normalized")) orig["phone_normalized"] = added.phone_normalized;
-
-    return {
-      ...orig,
-      clean: added.clean,
-      is_bad_number: added.is_bad_number,
-      status_array: added.status_array,
-      status: added.status,
-      tcpa: added.tcpa,
-      dnc_complainers: added.dnc_complainers,
-      federal_dnc: added.federal_dnc,
-      state_dnc: added.state_dnc,
-      state_code: added.state_code
+    return { ...orig,
+      clean: added.clean, is_bad_number: added.is_bad_number,
+      status_array: added.status_array, status: added.status,
+      tcpa: added.tcpa, dnc_complainers: added.dnc_complainers,
+      federal_dnc: added.federal_dnc, state_dnc: added.state_dnc, state_code: added.state_code
     };
   });
 
