@@ -1,10 +1,12 @@
-// server.js — scrub.repforce.ai (final: locked to your working endpoints)
-// Uses only:
-//   POST https://api.tcpalitigatorlist.com/scrub/phone/    (single; payload {phone_number,...})
-//   POST https://api.tcpalitigatorlist.com/scrub/phones/   (mass)
-//   POST https://api.tcpalitigatorlist.com/scrub/phones/get/ (poll job)
-// Features: mass-first + single fallback (per-record progress), keep-alive, token-bucket RPS limiter,
-// round-trip CSVs (original columns + scrub fields), summary breakdown, /debug/egress, CORS, Socket.IO
+// server.js — scrub.repforce.ai (stable + /health)
+// Uses only the verified endpoints for your tenant:
+//   POST {BASE}/scrub/phone/        (payload { phone_number, type, [state] })
+//   POST {BASE}/scrub/phones/       (mass)
+//   POST {BASE}/scrub/phones/get/   (poll)
+// Mass-first with single fallback (per-record progress)
+// Keep-alive + token-bucket RPS limiter
+// Round-trip CSVs (original columns + scrub fields) + summary
+// /health for Railway, /debug/egress for IP, CORS, Socket.IO
 
 import express from "express";
 import multer from "multer";
@@ -40,17 +42,13 @@ const FILE_TTL_HOURS = parseInt(process.env.FILE_TTL_HOURS || "72", 10);
 const TCPA_USER = process.env.TCPA_USER || "";
 const TCPA_PASS = process.env.TCPA_PASS || "";
 
-// Base host (swap to dedicated if provided)
 const TCPA_BASE = (process.env.TCPA_BASE || "https://api.tcpalitigatorlist.com").replace(/\/+$/,"");
+const MASS_URL        = `${TCPA_BASE}/scrub/phones/`;
+const MASS_GET_URL    = `${TCPA_BASE}/scrub/phones/get/`;
+const SINGLE_POST_URL = `${TCPA_BASE}/scrub/phone/`;
 
-// Fixed working routes for your tenant
-const MASS_URL       = `${TCPA_BASE}/scrub/phones/`;
-const MASS_GET_URL   = `${TCPA_BASE}/scrub/phones/get/`;
-const SINGLE_POST_URL= `${TCPA_BASE}/scrub/phone/`;
-
-// Throttle + mode knobs
 const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "64", 10);
-const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10);  // public ~50 rps; raise on dedicated
+const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10);    // public ~50; raise on dedicated
 const TCPA_FORCE_MODE = (process.env.TCPA_FORCE_MODE || "auto").toLowerCase(); // auto | single | mass
 
 await fs.mkdir(FILES_DIR, { recursive: true });
@@ -76,16 +74,17 @@ app.use((req,res,next)=>{
   next();
 });
 
-// ===== Static UI & files =====
-app.use("/ui", express.static(path.join(__dirname, "ui")));
-app.get("/", (_req,res)=>res.redirect("/ui"));
-app.use("/files", express.static(FILES_DIR));
-
-// Egress IP helper (send to TCPA if they whitelist)
+// ===== Health & Utility =====
+app.get("/health", (_req,res)=>res.status(200).send("OK"));  // <— Railway health check
 app.get("/debug/egress", async (_req,res)=>{
   try { const { data } = await axios.get("https://api.ipify.org?format=json", { timeout: 5000 }); res.json(data); }
   catch(e){ res.status(500).json({ error: e?.message || "ipify failed" }); }
 });
+
+// ===== Static UI & files =====
+app.use("/ui", express.static(path.join(__dirname, "ui")));
+app.get("/", (_req,res)=>res.redirect("/ui"));
+app.use("/files", express.static(FILES_DIR));
 
 // ===== Upload endpoint =====
 const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
@@ -101,12 +100,11 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
     const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
     if (parsed.errors?.length) throw new Error("CSV parse error");
 
-    // Preserve ALL original columns
+    // Preserve ALL original columns/rows
     const originalRows = parsed.data.map((row, idx) => ({ __idx: idx, __row: row }));
     const headerRow = parsed.meta?.fields || Object.keys(parsed.data[0] || {});
     const phoneKey = headerRow.find(h => String(h).toLowerCase().includes("phone")) || "phone";
 
-    // Build meta list + phones
     const metaRows = [];
     const phones = [];
     for (const { __idx, __row } of originalRows) {
@@ -124,12 +122,10 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
       throw new Error(`No phone numbers found (looking for a column like "phone"; detected "${phoneKey}").`);
 
     const jobId = Date.now().toString(36);
-    await fs.writeFile(
-      path.join(FILES_DIR, `upload_${jobId}.json`),
-      JSON.stringify({ total: metaRows.length, at: new Date().toISOString(), phoneKey })
-    );
+    await fs.writeFile(path.join(FILES_DIR, `upload_${jobId}.json`),
+      JSON.stringify({ total: metaRows.length, at: new Date().toISOString(), phoneKey }));
 
-    // Chunking only used by MASS; single fallback ignores chunks internally
+    // Chunking (only affects MASS batching/progress)
     const chunkSize = 10000;
     const chunks = [];
     for (let i=0;i<phones.length;i+=chunkSize) chunks.push(phones.slice(i,i+chunkSize));
@@ -149,7 +145,6 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
 io.on("connection", ()=>{});
 
 // ===== Keep-alive + RPS limiter =====
-import https from "https";
 const agent = new https.Agent({ keepAlive: true });
 const AX = axios.create({ httpsAgent: agent });
 
@@ -166,7 +161,6 @@ function acquireToken() {
 
 // ===== Utilities =====
 function safeJson(v){ try { return typeof v==="string" ? v : JSON.stringify(v); } catch { return String(v); } }
-
 function makeProgress(jobId, total) {
   let processed = 0, lastEmit = 0;
   const minIntervalMs = 60;
@@ -174,7 +168,7 @@ function makeProgress(jobId, total) {
   return { inc(n=1){ processed+=n; const now=Date.now(); if(now-lastEmit>=minIntervalMs){ lastEmit=now; emit(); } }, add(n=1){ this.inc(n); }, flush(){ emit(); } };
 }
 
-// ===== TCPA calls (locked to working routes) =====
+// ===== TCPA calls (locked to proven routes) =====
 async function massPost(payload) {
   const auth = { username: TCPA_USER, password: TCPA_PASS };
   await acquireToken();
@@ -404,7 +398,7 @@ setInterval(async ()=>{
     const ttlMs = FILE_TTL_HOURS * 3600 * 1000;
     const now = Date.now();
     for (const n of await fs.readdir(FILES_DIR)) {
-      const p = path.join(FILES_DIR, n);
+      const p = path.join(__dirname, "files", n);
       const st = await fs.stat(p);
       if (now - st.mtimeMs > ttlMs) await fs.rm(p, { force: true });
     }
