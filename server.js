@@ -1,9 +1,9 @@
-// server.js — scrub.repforce.ai (final, single endpoint fixed to /phone/scrub)
-// - Mass:  POST https://api.tcpalitigatorlist.com/scrub/phones/
-// - Single: POST https://api.tcpalitigatorlist.com/phone/scrub/   (per vendor email)
-// - Single payload uses "phone_number"
-// - Mass-first with single fallback (per-record progress), keep-alive, RPS limiter
-// - Round-trip CSVs (all original columns + scrub fields), summary breakdown, /debug/egress
+// server.js — scrub.repforce.ai (single endpoint multi-variant)
+// Tries, in order: POST /phone/scrub, POST /scrub/phone, GET /scrub/phone/tcpa/<number>
+// Mass:        POST /scrub/phones/   (+ /scrub/phones/get/)
+// Per-record progress in SINGLE mode, chunk progress in MASS
+// Round-trip CSVs (original columns preserved + appended scrub fields)
+// Keep-alive + token-bucket RPS limiter, /debug/egress, CORS, Socket.IO
 
 import express from "express";
 import multer from "multer";
@@ -39,18 +39,22 @@ const FILE_TTL_HOURS = parseInt(process.env.FILE_TTL_HOURS || "72", 10);
 const TCPA_USER = process.env.TCPA_USER || "";
 const TCPA_PASS = process.env.TCPA_PASS || "";
 
-// Base host (swap to dedicated if they give you one)
+// Base host (swap to dedicated if provided)
 const PRIMARY_BASE = (process.env.TCPA_BASE || "https://api.tcpalitigatorlist.com").replace(/\/+$/,"");
 const TCPA_BASES = [PRIMARY_BASE, "https://api101.tcpalitigatorlist.com"];
 
 // Valid routes (no /api prefix)
 const TCPA_MASS_PATHS     = ["/scrub/phones/"];
 const TCPA_MASS_GET_PATHS = ["/scrub/phones/get/"];
-const TCPA_SINGLE_PATHS   = ["/phone/scrub/"];   // <— fixed per vendor email
+
+// SINGLE variants we will try in order
+const SINGLE_POST_VARIANTS = ["/phone/scrub/", "/scrub/phone/"]; // JSON POST with phone_number
+// Legacy GET (type inline)
+const SINGLE_GET_TEMPLATE = (base, phone) => `${base}/scrub/phone/tcpa/${phone}`;
 
 // Throttle + mode knobs
 const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "64", 10);
-const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10);
+const RATE_LIMIT_RPS  = parseInt(process.env.RATE_LIMIT_RPS  || "45", 10);  // public ~50 rps; raise on dedicated
 const TCPA_FORCE_MODE = (process.env.TCPA_FORCE_MODE || "auto").toLowerCase(); // auto | single | mass
 
 await fs.mkdir(FILES_DIR, { recursive: true });
@@ -81,12 +85,10 @@ app.use("/ui", express.static(path.join(__dirname, "ui")));
 app.get("/", (_req,res)=>res.redirect("/ui"));
 app.use("/files", express.static(FILES_DIR));
 
-// Egress IP (send to TCPA if they whitelist)
+// Egress IP helper
 app.get("/debug/egress", async (_req,res)=>{
-  try {
-    const { data } = await axios.get("https://api.ipify.org?format=json", { timeout: 5000 });
-    res.json(data);
-  } catch (e) { res.status(500).json({ error: e?.message || "ipify failed" }); }
+  try { const { data } = await axios.get("https://api.ipify.org?format=json",{timeout:5000}); res.json(data); }
+  catch(e){ res.status(500).json({ error: e?.message || "ipify failed" }); }
 });
 
 // ===== Upload endpoint =====
@@ -103,7 +105,6 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
     const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
     if (parsed.errors?.length) throw new Error("CSV parse error");
 
-    // Preserve all original columns/rows
     const originalRows = parsed.data.map((row, idx) => ({ __idx: idx, __row: row }));
     const headerRow = parsed.meta?.fields || Object.keys(parsed.data[0] || {});
     const phoneKey = headerRow.find(h => String(h).toLowerCase().includes("phone")) || "phone";
@@ -125,12 +126,10 @@ app.post("/api/upload", upload.single("file"), async (req,res)=>{
       throw new Error(`No phone numbers found (looking for a column like "phone"; detected "${phoneKey}").`);
 
     const jobId = Date.now().toString(36);
-    await fs.writeFile(
-      path.join(FILES_DIR, `upload_${jobId}.json`),
-      JSON.stringify({ total: metaRows.length, at: new Date().toISOString(), phoneKey })
-    );
+    await fs.writeFile(path.join(FILES_DIR, `upload_${jobId}.json`),
+      JSON.stringify({ total: metaRows.length, at: new Date().toISOString(), phoneKey }));
 
-    const chunkSize = 10000; // mass batching/progress frequency
+    const chunkSize = 10000; // for mass batching/progress frequency
     const chunks = [];
     for (let i=0;i<phones.length;i+=chunkSize) chunks.push(phones.slice(i,i+chunkSize));
 
@@ -173,8 +172,8 @@ function makeProgress(jobId, total) {
   return { inc(n=1){ processed+=n; const now=Date.now(); if(now-lastEmit>=minIntervalMs){ lastEmit=now; emit(); } }, add(n=1){ this.inc(n); }, flush(){ emit(); } };
 }
 
-// ===== TCPA client helpers =====
-async function tcpapost(routeCandidates, payload) {
+// ===== TCPA MASS (JSON POST) =====
+async function tcpapostMass(routeCandidates, payload) {
   const auth = { username: TCPA_USER, password: TCPA_PASS };
   const errs = [];
   for (const base of TCPA_BASES) {
@@ -190,29 +189,45 @@ async function tcpapost(routeCandidates, payload) {
     }
   }
   const details = errs.map(x=>`[${x.status}] ${x.url} -> ${safeJson(x.body)}`).join(" | ");
-  throw new Error(`TCPA request failed: ${details}`);
+  throw new Error(`TCPA mass failed: ${details}`);
 }
 
-async function tcpapostSingle(routeCandidates, payload) {
+// ===== TCPA SINGLE (try multiple variants) =====
+async function tcpapostSingleMulti(phone, types, states) {
   const auth = { username: TCPA_USER, password: TCPA_PASS };
+  const payload = { phone_number: phone, type: Array.isArray(types)&&types.length===1 ? String(types[0]) : types };
+  if (states?.length) payload.state = states;
   const errs = [];
+
+  // 1) POST variants
   for (const base of TCPA_BASES) {
-    for (const route of routeCandidates) {
-      const url = `${base}${route}`;
+    for (const route of SINGLE_POST_VARIANTS) {
       try {
         await acquireToken();
-        const { data } = await AX.post(url, payload, { auth, timeout: 12000 });
+        const { data } = await AX.post(`${base}${route}`, payload, { auth, timeout: 12000 });
         return data;
       } catch (e) {
-        errs.push({ url, status: e?.response?.status, body: e?.response?.data });
+        errs.push({ url: `${base}${route}`, status: e?.response?.status, body: e?.response?.data });
       }
     }
   }
+  // 2) GET legacy variant
+  for (const base of TCPA_BASES) {
+    const url = SINGLE_GET_TEMPLATE(base, phone);
+    try {
+      await acquireToken();
+      const { data } = await AX.get(url, { auth, timeout: 12000 });
+      return data;
+    } catch (e) {
+      errs.push({ url, status: e?.response?.status, body: e?.response?.data });
+    }
+  }
+
   const details = errs.map(x=>`[${x.status}] ${x.url} -> ${safeJson(x.body)}`).join(" | ");
   throw new Error(`TCPA single failed: ${details}`);
 }
 
-// ===== Single-endpoint fallback (per-record progress) =====
+// ===== SINGLE fallback worker (per-record progress) =====
 async function scrubViaSingleEndpoint(phones, types, states, prog) {
   const results = [];
   const queue = [...phones];
@@ -221,11 +236,8 @@ async function scrubViaSingleEndpoint(phones, types, states, prog) {
   async function worker() {
     while (queue.length) {
       const phone = queue.shift();
-      const payload = { phone_number: phone, type: Array.isArray(types) && types.length === 1 ? String(types[0]) : types };
-      if (states?.length) payload.state = states;
-
       try {
-        const data = await tcpapostSingle(TCPA_SINGLE_PATHS, payload);
+        const data = await tcpapostSingleMulti(phone, types, states);
         const r = data?.result || (Array.isArray(data?.results) ? data.results[0] : null) || {};
         results.push({
           phone_number: r.phone_number || phone,
@@ -247,7 +259,7 @@ async function scrubViaSingleEndpoint(phones, types, states, prog) {
   return results;
 }
 
-// ===== Merge results back to ORIGINAL columns =====
+// ===== Merge results into ORIGINAL rows =====
 function mergeOriginalWithResults(metaRows, results, phoneKey) {
   const phoneToIdxQ = new Map();
   for (const mr of metaRows) {
@@ -330,7 +342,7 @@ async function scrubInChunks(jobId, chunks, options, metaRows, phoneKey) {
     let data;
     try {
       if (TCPA_FORCE_MODE === "single") throw new Error("force_single");
-      data = await tcpapost(TCPA_MASS_PATHS, payload);
+      data = await tcpapostMass(TCPA_MASS_PATHS, payload);
     } catch (e) {
       const msg = String(e?.message || "");
       const forbidden = msg.includes("401") && msg.includes("rest_forbidden");
@@ -348,7 +360,7 @@ async function scrubInChunks(jobId, chunks, options, metaRows, phoneKey) {
       continue;
     }
     if (data?.job_id) {
-      const out = await tcpapost(TCPA_MASS_GET_PATHS, { job_id: data.job_id });
+      const out = await tcpapostMass(TCPA_MASS_GET_PATHS, { job_id: data.job_id });
       if (!out?.ready || !Array.isArray(out?.results)) throw new Error(`TCPA job not ready or invalid response for job_id ${data.job_id}`);
       results.push(...out.results);
       prog.add(phones.length);
